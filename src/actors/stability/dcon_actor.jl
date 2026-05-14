@@ -875,6 +875,14 @@ function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple
     if !isfile(csv_file)
         write(csv_file, header)
     end
+    function csv_field(value)
+        text = string(value)
+        if occursin(',', text) || occursin('"', text) || occursin('\n', text) || occursin('\r', text)
+            return "\"" * replace(text, "\"" => "\"\"") * "\""
+        else
+            return text
+        end
+    end
     line = join((
         row.case,
         row.status,
@@ -888,12 +896,154 @@ function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple
         row.expin,
         row.expout,
         row.widthp,
-        row.workdir,
-        replace(row.error, '\n' => ' ')), ",") * "\n"
+        csv_field(row.workdir),
+        csv_field(replace(row.error, '\n' => ' '))), ",") * "\n"
     open(csv_file, "a") do io
         write(io, line)
     end
     return csv_file
+end
+
+function _hmode_pressure_csv_max_case(csv_file::AbstractString)
+    isfile(csv_file) || return 0
+    max_case = 0
+    for (k, line) in enumerate(eachline(csv_file))
+        k == 1 && continue
+        isempty(strip(line)) && continue
+        value = tryparse(Int, first(split(line, ',')))
+        value === nothing || (max_case = max(max_case, value))
+    end
+    return max_case
+end
+
+function _hmode_pressure_beta_from_objective(
+    objective::Real,
+    constraints::AbstractVector;
+    penalty_unstable::Real,
+    penalty_failed::Real)
+
+    isfinite(objective) || return NaN
+    objective >= 0.5 * penalty_failed && return NaN
+    unstable = !isempty(constraints) && any(g -> !isfinite(g) || g > 0.0, constraints)
+    if unstable
+        objective >= 0.5 * penalty_unstable || return NaN
+        return Float64(penalty_unstable - objective)
+    else
+        return Float64(-objective)
+    end
+end
+
+function _seed_hmode_pressure_best_from_state!(
+    best_feasible_beta::Base.RefValue{Float64},
+    best_feasible_parameters::Base.RefValue{Dict{Symbol,Float64}},
+    best_observed_beta::Base.RefValue{Float64},
+    best_observed_parameters::Base.RefValue{Dict{Symbol,Float64}},
+    state;
+    penalty_unstable::Real,
+    penalty_failed::Real)
+
+    state === nothing && return nothing
+    size(state.X, 1) == length(state.y) || return nothing
+
+    for i in axes(state.X, 1)
+        constraints = isempty(state.constraints) ? Float64[] : collect(view(state.constraints, i, :))
+        beta_normal = _hmode_pressure_beta_from_objective(
+            state.y[i],
+            constraints;
+            penalty_unstable,
+            penalty_failed)
+        isfinite(beta_normal) || continue
+
+        pars = _hmode_pressure_parameter_dict(collect(view(state.X, i, :)))
+        unstable = !isempty(constraints) && any(g -> !isfinite(g) || g > 0.0, constraints)
+        if beta_normal > best_observed_beta[]
+            best_observed_beta[] = beta_normal
+            best_observed_parameters[] = copy(pars)
+        end
+        if !unstable && beta_normal > best_feasible_beta[]
+            best_feasible_beta[] = beta_normal
+            best_feasible_parameters[] = copy(pars)
+        end
+    end
+    return nothing
+end
+
+function _evaluate_hmode_pressure_DCON_row(
+    dd::IMAS.dd,
+    act::ParametersAllActors,
+    x::AbstractVector,
+    case_id::Int,
+    save_folder::AbstractString;
+    chease_free_boundary::Bool=false,
+    dcon_cleardir::Bool=false,
+    equilibrium_ip_from::Symbol=:pulse_schedule,
+    verbose::Bool=false,
+    penalty_unstable::Float64=1e6,
+    penalty_failed::Float64=1e9)
+
+    pars = _hmode_pressure_parameter_dict(x)
+    workdir = joinpath(save_folder, "case_$(lpad(case_id, 5, "0"))")
+    try
+        result = evaluate_Hmode_pressure_DCON(
+            dd,
+            act,
+            x;
+            workdir,
+            chease_free_boundary,
+            dcon_cleardir,
+            equilibrium_ip_from,
+            verbose)
+        unstable = !(result.ideal_stable && result.ballooning_stable)
+        penalty = unstable ? penalty_unstable : 0.0
+        objective = -result.beta_normal + penalty
+        status = unstable ? :unstable : :success
+        return (
+            status=status,
+            objective=objective,
+            constraints=(result.ideal_stable ? 0.0 : 1.0, result.ballooning_stable ? 0.0 : 1.0),
+            beta_normal=result.beta_normal,
+            unstable=unstable,
+            pars=pars,
+            row=(
+                case=case_id,
+                status=String(status),
+                objective=objective,
+                beta_normal=result.beta_normal,
+                ideal_stable=result.ideal_stable,
+                ballooning_stable=result.ballooning_stable,
+                edge=pars[:edge],
+                ped=pars[:ped],
+                core=pars[:core],
+                expin=pars[:expin],
+                expout=pars[:expout],
+                widthp=pars[:widthp],
+                workdir=workdir,
+                error=""))
+    catch e
+        isa(e, InterruptException) && rethrow(e)
+        return (
+            status=:fail,
+            objective=penalty_failed,
+            constraints=(1.0, 1.0),
+            beta_normal=NaN,
+            unstable=true,
+            pars=pars,
+            row=(
+                case=case_id,
+                status="fail",
+                objective=penalty_failed,
+                beta_normal=NaN,
+                ideal_stable=false,
+                ballooning_stable=false,
+                edge=pars[:edge],
+                ped=pars[:ped],
+                core=pars[:core],
+                expin=pars[:expin],
+                expout=pars[:expout],
+                widthp=pars[:widthp],
+                workdir=workdir,
+                error=sprint(showerror, e)))
+    end
 end
 
 function optimize_Hmode_pressure_DCON(
@@ -913,17 +1063,29 @@ function optimize_Hmode_pressure_DCON(
     dcon_cleardir::Bool=false,
     equilibrium_ip_from::Symbol=:pulse_schedule,
     threaded::Bool=Threads.nthreads() > 1,
+    distributed::Bool=false,
+    distributed_workers::Vector{Int}=Distributed.workers(),
+    continue_state=nothing,
     verbose::Bool=false,
     kw...)
 
     mkpath(save_folder)
     lowerbounds, upperbounds = _bounds_from_namedtuple(parameter_bounds)
     csv_file = joinpath(save_folder, "hmode_pressure_dcon_results.csv")
-    counter = Ref(0)
+    state_count = continue_state === nothing ? 0 : size(continue_state.X, 1)
+    counter = Ref(max(state_count, _hmode_pressure_csv_max_case(csv_file)))
     best_feasible_beta = Ref(-Inf)
     best_feasible_parameters = Ref(Dict{Symbol,Float64}())
     best_observed_beta = Ref(-Inf)
     best_observed_parameters = Ref(Dict{Symbol,Float64}())
+    _seed_hmode_pressure_best_from_state!(
+        best_feasible_beta,
+        best_feasible_parameters,
+        best_observed_beta,
+        best_observed_parameters,
+        continue_state;
+        penalty_unstable,
+        penalty_failed)
     write_lock = ReentrantLock()
     best_lock = ReentrantLock()
 
@@ -962,68 +1124,58 @@ function optimize_Hmode_pressure_DCON(
         case_ids = collect(counter[] .+ (1:n))
         counter[] += n
 
-        function evaluate_one!(i)
-            case_id = case_ids[i]
-            x = collect(X[i, :])
-            pars = _hmode_pressure_parameter_dict(x)
-            workdir = joinpath(save_folder, "case_$(lpad(case_id, 5, "0"))")
-            try
-                result = evaluate_Hmode_pressure_DCON(
-                    dd,
-                    act,
-                    x;
-                    workdir,
-                    chease_free_boundary,
-                    dcon_cleardir,
-                    equilibrium_ip_from,
-                    verbose)
-                unstable = !(result.ideal_stable && result.ballooning_stable)
-                penalty = unstable ? penalty_unstable : 0.0
-                y[i] = -result.beta_normal + penalty
-                constraints[i, 1] = result.ideal_stable ? 0.0 : 1.0
-                constraints[i, 2] = result.ballooning_stable ? 0.0 : 1.0
-                status[i] = unstable ? :unstable : :success
-                update_best!(pars, result.beta_normal, unstable)
-                append_result((
-                    case=case_id,
-                    status=String(status[i]),
-                    objective=y[i],
-                    beta_normal=result.beta_normal,
-                    ideal_stable=result.ideal_stable,
-                    ballooning_stable=result.ballooning_stable,
-                    edge=pars[:edge],
-                    ped=pars[:ped],
-                    core=pars[:core],
-                    expin=pars[:expin],
-                    expout=pars[:expout],
-                    widthp=pars[:widthp],
-                    workdir=workdir,
-                    error=""))
-            catch e
-                isa(e, InterruptException) && rethrow(e)
-                y[i] = penalty_failed
-                constraints[i, :] .= 1.0
-                status[i] = :fail
-                append_result((
-                    case=case_id,
-                    status="fail",
-                    objective=y[i],
-                    beta_normal=NaN,
-                    ideal_stable=false,
-                    ballooning_stable=false,
-                    edge=pars[:edge],
-                    ped=pars[:ped],
-                    core=pars[:core],
-                    expin=pars[:expin],
-                    expout=pars[:expout],
-                    widthp=pars[:widthp],
-                    workdir=workdir,
-                    error=sprint(showerror, e)))
-            end
+        function apply_result!(i, result)
+            y[i] = result.objective
+            constraints[i, 1] = result.constraints[1]
+            constraints[i, 2] = result.constraints[2]
+            status[i] = result.status
+            isfinite(result.beta_normal) && update_best!(result.pars, result.beta_normal, result.unstable)
+            append_result(result.row)
             return nothing
         end
 
-        if threaded && n > 1
+        function evaluate_one!(i)
+            case_id = case_ids[i]
+            x = collect(X[i, :])
+            result = _evaluate_hmode_pressure_DCON_row(
+                dd,
+                act,
+                x,
+                case_id,
+                save_folder;
+                chease_free_boundary,
+                dcon_cleardir,
+                equilibrium_ip_from,
+                verbose,
+                penalty_unstable,
+                penalty_failed)
+            apply_result!(i, result)
+            return nothing
+        end
+
+        if distributed && n > 1
+            isempty(distributed_workers) && error("distributed=true requires at least one Distributed worker")
+            inputs = [(case_ids[i], collect(X[i, :])) for i in 1:n]
+            worker_pool = Distributed.WorkerPool(distributed_workers)
+            results = Distributed.pmap(worker_pool, inputs) do item
+                case_id, x = item
+                _evaluate_hmode_pressure_DCON_row(
+                    dd,
+                    act,
+                    x,
+                    case_id,
+                    save_folder;
+                    chease_free_boundary,
+                    dcon_cleardir,
+                    equilibrium_ip_from,
+                    verbose,
+                    penalty_unstable,
+                    penalty_failed)
+            end
+            for i in 1:n
+                apply_result!(i, results[i])
+            end
+        elseif threaded && n > 1
             Threads.@threads for i in 1:n
                 evaluate_one!(i)
             end
@@ -1037,7 +1189,7 @@ function optimize_Hmode_pressure_DCON(
     end
 
     checkpoint_file = joinpath(save_folder, "hmode_pressure_dcon_bayes.jls")
-    checkpoint_callback = state -> save_bayesian_optimization(checkpoint_file, state, dd, act, nothing, nothing)
+    checkpoint_callback = state -> save_bayesian_optimization(checkpoint_file, state, nothing, nothing, nothing, nothing)
     state = bayesian_optimization_loop(
         evaluate_batch,
         lowerbounds,
@@ -1048,9 +1200,10 @@ function optimize_Hmode_pressure_DCON(
         n_candidates,
         rng_seed,
         acquisition,
+        continue_state,
         checkpoint_callback,
         kw...)
-    save_bayesian_optimization(checkpoint_file, state, dd, act, nothing, nothing)
+    save_bayesian_optimization(checkpoint_file, state, nothing, nothing, nothing, nothing)
 
     return (
         state=state,

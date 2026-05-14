@@ -108,9 +108,11 @@ function _step(actor::ActorCHEASE)
             par.rescale_eq_to_ip,
             par.clear_workdir)
     catch e
-        display(plot(pr, pz; marker=:circle, aspect_ratio=:equal))
-        display(plot(rho_pol, pressure; marker=:circle, xlabel="sqrt(ψ)", title="Pressure [Pa]"))
-        display(plot(rho_pol, j_tor; marker=:circle, xlabel="sqrt(ψ)", title="Jtor [A]"))
+        if lowercase(get(ENV, "FUSE_CHEASE_ERROR_PLOTS", "false")) in ("1", "true", "yes")
+            display(plot(pr, pz; marker=:circle, aspect_ratio=:equal))
+            display(plot(rho_pol, pressure; marker=:circle, xlabel="sqrt(ψ)", title="Pressure [Pa]"))
+            display(plot(rho_pol, j_tor; marker=:circle, xlabel="sqrt(ψ)", title="Jtor [A]"))
+        end
         rethrow(e)
     end
 
