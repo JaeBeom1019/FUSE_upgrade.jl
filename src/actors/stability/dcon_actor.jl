@@ -912,6 +912,7 @@ function optimize_Hmode_pressure_DCON(
     chease_free_boundary::Bool=false,
     dcon_cleardir::Bool=false,
     equilibrium_ip_from::Symbol=:pulse_schedule,
+    threaded::Bool=Threads.nthreads() > 1,
     verbose::Bool=false,
     kw...)
 
@@ -923,15 +924,46 @@ function optimize_Hmode_pressure_DCON(
     best_feasible_parameters = Ref(Dict{Symbol,Float64}())
     best_observed_beta = Ref(-Inf)
     best_observed_parameters = Ref(Dict{Symbol,Float64}())
+    write_lock = ReentrantLock()
+    best_lock = ReentrantLock()
+
+    function append_result(row)
+        lock(write_lock)
+        try
+            _append_hmode_pressure_result(csv_file, row)
+        finally
+            unlock(write_lock)
+        end
+        return nothing
+    end
+
+    function update_best!(pars, beta_normal, unstable)
+        lock(best_lock)
+        try
+            if beta_normal > best_observed_beta[]
+                best_observed_beta[] = beta_normal
+                best_observed_parameters[] = copy(pars)
+            end
+            if !unstable && beta_normal > best_feasible_beta[]
+                best_feasible_beta[] = beta_normal
+                best_feasible_parameters[] = copy(pars)
+            end
+        finally
+            unlock(best_lock)
+        end
+        return nothing
+    end
 
     function evaluate_batch(X, state)
-        y = Vector{Float64}(undef, size(X, 1))
-        constraints = Matrix{Float64}(undef, size(X, 1), 2)
-        status = Vector{Symbol}(undef, size(X, 1))
+        n = size(X, 1)
+        y = Vector{Float64}(undef, n)
+        constraints = Matrix{Float64}(undef, n, 2)
+        status = Vector{Symbol}(undef, n)
+        case_ids = collect(counter[] .+ (1:n))
+        counter[] += n
 
-        for i in axes(X, 1)
-            counter[] += 1
-            case_id = counter[]
+        function evaluate_one!(i)
+            case_id = case_ids[i]
             x = collect(X[i, :])
             pars = _hmode_pressure_parameter_dict(x)
             workdir = joinpath(save_folder, "case_$(lpad(case_id, 5, "0"))")
@@ -951,15 +983,8 @@ function optimize_Hmode_pressure_DCON(
                 constraints[i, 1] = result.ideal_stable ? 0.0 : 1.0
                 constraints[i, 2] = result.ballooning_stable ? 0.0 : 1.0
                 status[i] = unstable ? :unstable : :success
-                if result.beta_normal > best_observed_beta[]
-                    best_observed_beta[] = result.beta_normal
-                    best_observed_parameters[] = pars
-                end
-                if !unstable && result.beta_normal > best_feasible_beta[]
-                    best_feasible_beta[] = result.beta_normal
-                    best_feasible_parameters[] = pars
-                end
-                _append_hmode_pressure_result(csv_file, (
+                update_best!(pars, result.beta_normal, unstable)
+                append_result((
                     case=case_id,
                     status=String(status[i]),
                     objective=y[i],
@@ -979,7 +1004,7 @@ function optimize_Hmode_pressure_DCON(
                 y[i] = penalty_failed
                 constraints[i, :] .= 1.0
                 status[i] = :fail
-                _append_hmode_pressure_result(csv_file, (
+                append_result((
                     case=case_id,
                     status="fail",
                     objective=y[i],
@@ -994,6 +1019,17 @@ function optimize_Hmode_pressure_DCON(
                     widthp=pars[:widthp],
                     workdir=workdir,
                     error=sprint(showerror, e)))
+            end
+            return nothing
+        end
+
+        if threaded && n > 1
+            Threads.@threads for i in 1:n
+                evaluate_one!(i)
+            end
+        else
+            for i in 1:n
+                evaluate_one!(i)
             end
         end
 
