@@ -146,6 +146,7 @@ include(joinpath("actors", "stability", "limits_actor.jl"))
 include(joinpath("actors", "stability", "limit_models.jl"))
 include(joinpath("actors", "stability", "troyon_actor.jl"))
 include(joinpath("actors", "stability", "vertical_actor.jl"))
+include(joinpath("actors", "stability", "dcon_actor.jl"))
 
 include(joinpath("actors", "balance_plant", "thermal_plant_actor.jl"))
 include(joinpath("actors", "balance_plant", "power_needs_actor.jl"))
@@ -173,6 +174,7 @@ include(joinpath("parameters", "parameters_actors.jl"))
 #  OPTIMIZATION  #
 #= ============ =#
 include("optimization.jl")
+include("bayesian_optimization.jl")
 
 #= ======= =#
 #  STUDIES  #
@@ -181,6 +183,7 @@ include(joinpath("parameters", "parameters_studies.jl"))
 include("studies.jl")
 include(joinpath("studies", "database_generator.jl"))
 include(joinpath("studies", "multi_objective_optimization.jl"))
+include(joinpath("studies", "bayesian_optimization.jl"))
 include(joinpath("studies", "TGLF_database.jl"))
 include(joinpath("studies", "study_database.jl"))
 include(joinpath("studies", "experiment_postdictive.jl"))
@@ -191,6 +194,7 @@ include(joinpath("studies", "HDB5_validation.jl"))
 #  WORKFLOWS  #
 #= ========= =#
 include(joinpath("workflows", "optimization_workflow.jl"))
+include(joinpath("workflows", "bayesian_optimization_workflow.jl"))
 
 #= ======= =#
 #  LOGGING  #

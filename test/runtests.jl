@@ -18,6 +18,10 @@ else
 
     include("runtests_basics.jl")
 
+    include("runtests_bayesian_optimization.jl")
+
+    include("runtests_equilibrium_interpolation.jl")
+
     include("runtests_cases.jl")
 
     include("runtests_actors.jl")

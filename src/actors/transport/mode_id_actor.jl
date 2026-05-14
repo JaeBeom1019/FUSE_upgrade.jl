@@ -1,5 +1,21 @@
-import TurbulentTransport: TurbulenceMode, AbstractModeIdentification, TJLFModeIdentification, NNModeIdentification, identify_modes, run_modeid_nn, MODE_COLORS, MODE_LABELS
+import TurbulentTransport
 using LaTeXStrings
+
+if all(isdefined(TurbulentTransport, s) for s in (:TurbulenceMode, :AbstractModeIdentification, :identify_modes, :run_modeid_nn, :MODE_COLORS, :MODE_LABELS))
+    const TurbulenceMode = TurbulentTransport.TurbulenceMode
+    const AbstractModeIdentification = TurbulentTransport.AbstractModeIdentification
+    const identify_modes = TurbulentTransport.identify_modes
+    const run_modeid_nn = TurbulentTransport.run_modeid_nn
+    const MODE_COLORS = TurbulentTransport.MODE_COLORS
+    const MODE_LABELS = TurbulentTransport.MODE_LABELS
+else
+    @enum TurbulenceMode ITG TEM KBM ETG MTM UNKNOWN_MODE
+    abstract type AbstractModeIdentification{D} end
+    const MODE_COLORS = Dict(ITG => "green", TEM => "orange", KBM => "violet", ETG => "blue", MTM => "red", UNKNOWN_MODE => "gray")
+    const MODE_LABELS = Dict(ITG => "ITG", TEM => "TEM", KBM => "KBM", ETG => "ETG", MTM => "MTM", UNKNOWN_MODE => "unknown")
+    identify_modes(args...; kw...) = error("TurbulentTransport mode-identification API is unavailable in this environment")
+    run_modeid_nn(args...; kw...) = error("TurbulentTransport mode-identification API is unavailable in this environment")
+end
 
 #= =========== =#
 #  ActorModeID  #

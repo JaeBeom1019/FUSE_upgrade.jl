@@ -127,6 +127,9 @@ function _finalize(actor::ActorEquilibrium)
 
     if par.model ∉ (:none, :replay)
         eqt = dd.equilibrium.time_slice[]
+        if !ismissing(eqt.profiles_1d, :dpressure_dpsi) && !isempty(eqt.profiles_1d.dpressure_dpsi)
+            _regularize_axis_derivative!(eqt.profiles_1d.dpressure_dpsi)
+        end
 
         # symmetrize equilibrium if requested and number of X-points is even
         x_points = IMAS.x_points(dd.pulse_schedule.position_control.x_point)
@@ -163,6 +166,67 @@ function _finalize(actor::ActorEquilibrium)
     return actor
 end
 
+function _normalized_psi(psi::AbstractVector, fallback_psi_norm::AbstractVector)
+    if length(psi) > 1 && all(isfinite, psi) && psi[end] != psi[1]
+        psi_norm = @. (psi - psi[1]) / (psi[end] - psi[1])
+    else
+        psi_norm = fallback_psi_norm
+    end
+    return clamp.(collect(psi_norm), 0.0, 1.0)
+end
+
+function _axis_regularized_profile_interpolant(rho::AbstractVector, values::AbstractVector, label::Symbol)
+    length(rho) == length(values) || throw(DimensionMismatch("$label profile grid and values have different lengths"))
+    valid = findall(k -> isfinite(rho[k]) && isfinite(values[k]), eachindex(rho))
+    length(valid) >= 3 || error("Need at least three finite points to interpolate $label profile")
+
+    rho_valid = collect(Float64, rho[valid])
+    values_valid = collect(Float64, values[valid])
+    order = sortperm(rho_valid)
+    rho_valid = rho_valid[order]
+    values_valid = values_valid[order]
+
+    unique_rho = Float64[]
+    unique_values = Float64[]
+    for (r, v) in zip(rho_valid, values_valid)
+        if isempty(unique_rho) || abs(r - unique_rho[end]) > 1e-10
+            push!(unique_rho, r)
+            push!(unique_values, v)
+        else
+            unique_values[end] = v
+        end
+    end
+
+    if first(unique_rho) > 1e-8
+        pushfirst!(unique_rho, 0.0)
+        pushfirst!(unique_values, first(unique_values))
+    else
+        unique_rho[1] = 0.0
+    end
+
+    length(unique_rho) >= 3 || error("Need at least three unique radial points to interpolate $label profile")
+
+    rho_mirror = vcat(-reverse(unique_rho[2:end]), unique_rho)
+    values_mirror = vcat(reverse(unique_values[2:end]), unique_values)
+    return IMAS.interp1d(rho_mirror, values_mirror, :pchip)
+end
+
+function _regularize_axis_derivative!(values::AbstractVector)
+    length(values) >= 2 || return values
+    if !isfinite(values[1])
+        values[1] = values[2]
+        return values
+    end
+    isfinite(values[2]) || return values
+
+    scale = max(abs(values[2]), eps(Float64))
+    if sign(values[1]) != sign(values[2]) || abs(values[1]) > 100.0 * scale
+        values[1] = values[2]
+    end
+
+    return values
+end
+
 """
     prepare(actor::ActorEquilibrium)
 
@@ -181,28 +245,25 @@ function prepare(actor::ActorEquilibrium)
     ps = dd.pulse_schedule
     pc = ps.position_control
 
-    # make sure j_tor and pressure on axis come in with zero gradient
+    # make sure j_tor and pressure on axis come in with zero rho-gradient without flattening the core
     if par.j_p_from == :core_profiles
         @assert !isempty(dd.core_profiles.time)
         cp1d = dd.core_profiles.profiles_1d[]
-        index = cp1d.grid.psi_norm .> 0.02
         psi0 = cp1d.grid.psi
+        psi_norm0 = _normalized_psi(psi0, cp1d.grid.psi_norm)
         rho_tor_norm0 = cp1d.grid.rho_tor_norm
-        rho_pol_norm_sqrt0 = vcat(-reverse(sqrt.(cp1d.grid.psi_norm[index])), sqrt.(cp1d.grid.psi_norm[index]))
-        j_tor0 = vcat(reverse(cp1d.j_tor[index]), cp1d.j_tor[index])
-        pressure0 = vcat(reverse(cp1d.pressure[index]), cp1d.pressure[index])
-        j_itp = IMAS.interp1d(rho_pol_norm_sqrt0, j_tor0, :pchip)
-        p_itp = IMAS.interp1d(rho_pol_norm_sqrt0, pressure0, :pchip)
+        rho_pol_norm_sqrt0 = sqrt.(psi_norm0)
+        j_itp = _axis_regularized_profile_interpolant(rho_pol_norm_sqrt0, cp1d.j_tor, :j_tor)
+        p_itp = _axis_regularized_profile_interpolant(rho_pol_norm_sqrt0, cp1d.pressure, :pressure)
     elseif par.j_p_from == :equilibrium
         @assert !isempty(dd.equilibrium.time)
         eqt1d = dd.equilibrium.time_slice[].profiles_1d
         psi0 = eqt1d.psi
+        psi_norm0 = _normalized_psi(psi0, eqt1d.psi_norm)
         rho_tor_norm0 = eqt1d.rho_tor_norm
-        rho_pol_norm_sqrt0 = sqrt.(eqt1d.psi_norm)
-        j_tor0 = eqt1d.j_tor
-        pressure0 = eqt1d.pressure
-        j_itp = IMAS.interp1d(rho_pol_norm_sqrt0, j_tor0, :pchip)
-        p_itp = IMAS.interp1d(rho_pol_norm_sqrt0, pressure0, :pchip)
+        rho_pol_norm_sqrt0 = sqrt.(psi_norm0)
+        j_itp = _axis_regularized_profile_interpolant(rho_pol_norm_sqrt0, eqt1d.j_tor, :j_tor)
+        p_itp = _axis_regularized_profile_interpolant(rho_pol_norm_sqrt0, eqt1d.pressure, :pressure)
     else
         @assert par.j_p_from in (:core_profiles, :equilibrium)
     end
@@ -284,8 +345,8 @@ function prepare(actor::ActorEquilibrium)
     eqt1d = dd.equilibrium.time_slice[].profiles_1d
     eqt1d.psi = psi0
     eqt1d.rho_tor_norm = rho_tor_norm0
-    eqt1d.j_tor = j_itp.(sqrt.(eqt1d.psi_norm))
-    eqt1d.pressure = p_itp.(sqrt.(eqt1d.psi_norm))
+    eqt1d.j_tor = j_itp.(rho_pol_norm_sqrt0)
+    eqt1d.pressure = p_itp.(rho_pol_norm_sqrt0)
 
     # calculate pressure and j_tor using geometry from previous iteration
     # this is for equilibrium codes that cannot solve directly from pressure and current
