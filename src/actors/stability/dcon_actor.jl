@@ -837,6 +837,12 @@ function evaluate_Hmode_pressure_DCON(
     chease_free_boundary::Bool=false,
     dcon_cleardir::Bool=false,
     equilibrium_ip_from::Symbol=:pulse_schedule,
+    qed_before_equilibrium::Bool=false,
+    qed_qmin_desired::Float64=1.0,
+    qed_equilibrium_iterations::Int=1,
+    qed_ip_from::Union{Nothing,Symbol}=nothing,
+    sawteeth_source_after_qed::Bool=false,
+    sawteeth_flat_factor::Float64=1.0,
     verbose::Bool=false)
 
     dd_case = deepcopy(dd)
@@ -852,10 +858,35 @@ function evaluate_Hmode_pressure_DCON(
     act_case.ActorDCON.ballooning = true
     act_case.ActorDCON.verbose = verbose
 
-    ActorEquilibrium(dd_case, act_case; ip_from=equilibrium_ip_from)
+    if qed_before_equilibrium
+        ActorEquilibrium(dd_case, act_case; ip_from=equilibrium_ip_from)
+        act_case.ActorCurrent.model = :QED
+        act_case.ActorCurrent.ip_from = something(qed_ip_from, equilibrium_ip_from)
+        act_case.ActorCurrent.vloop_from = :equilibrium
+        act_case.ActorQED.solve_for = :ip
+        act_case.ActorQED.ip_from = something(qed_ip_from, equilibrium_ip_from)
+        act_case.ActorQED.vloop_from = :equilibrium
+        act_case.ActorQED.qmin_desired = qed_qmin_desired
+        for _ in 1:max(qed_equilibrium_iterations, 1)
+            ActorCurrent(dd_case, act_case; ip_from=something(qed_ip_from, equilibrium_ip_from))
+            if sawteeth_source_after_qed
+                ActorSawteethSource(dd_case, act_case; qmin_desired=qed_qmin_desired, flat_factor=sawteeth_flat_factor)
+            end
+            ActorEquilibrium(dd_case, act_case; ip_from=equilibrium_ip_from)
+        end
+    else
+        ActorEquilibrium(dd_case, act_case; ip_from=equilibrium_ip_from)
+    end
     ActorDCON(dd_case, act_case)
 
     beta_normal = Float64(dd_case.equilibrium.time_slice[].global_quantities.beta_normal)
+    q_profile = try
+        Float64.(dd_case.equilibrium.time_slice[].profiles_1d.q)
+    catch
+        Float64.(dd_case.core_profiles.profiles_1d[].q)
+    end
+    q_axis = isempty(q_profile) ? NaN : first(q_profile)
+    q_min = isempty(q_profile) ? NaN : minimum(q_profile)
     dcon, ballooning = _dcon_metrics(dd_case)
     ballooning_stable = !isempty(ballooning) && any(x -> isinf(x) && x > 0, ballooning)
     ideal_stable = !isempty(dcon) && all(x -> isfinite(x) && x >= 0.0, dcon)
@@ -863,6 +894,8 @@ function evaluate_Hmode_pressure_DCON(
     return (
         dd=dd_case,
         beta_normal=beta_normal,
+        q_axis=q_axis,
+        q_min=q_min,
         dcon=dcon,
         ballooning=ballooning,
         ideal_stable=ideal_stable,
@@ -871,7 +904,7 @@ function evaluate_Hmode_pressure_DCON(
 end
 
 function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple)
-    header = "case,status,objective,beta_normal,ideal_stable,ballooning_stable,edge,ped,core,expin,expout,widthp,workdir,error\n"
+    header = "case,status,objective,beta_normal,q_axis,q_min,ideal_stable,ballooning_stable,edge,ped,core,expin,expout,widthp,workdir,error\n"
     if !isfile(csv_file)
         write(csv_file, header)
     end
@@ -888,6 +921,8 @@ function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple
         row.status,
         row.objective,
         row.beta_normal,
+        row.q_axis,
+        row.q_min,
         row.ideal_stable,
         row.ballooning_stable,
         row.edge,
@@ -977,6 +1012,13 @@ function _evaluate_hmode_pressure_DCON_row(
     chease_free_boundary::Bool=false,
     dcon_cleardir::Bool=false,
     equilibrium_ip_from::Symbol=:pulse_schedule,
+    qed_before_equilibrium::Bool=false,
+    qed_qmin_desired::Float64=1.0,
+    qed_equilibrium_iterations::Int=1,
+    qed_ip_from::Union{Nothing,Symbol}=nothing,
+    sawteeth_source_after_qed::Bool=false,
+    sawteeth_flat_factor::Float64=1.0,
+    q_min_required::Float64=0.0,
     verbose::Bool=false,
     penalty_unstable::Float64=1e6,
     penalty_failed::Float64=1e9)
@@ -992,15 +1034,23 @@ function _evaluate_hmode_pressure_DCON_row(
             chease_free_boundary,
             dcon_cleardir,
             equilibrium_ip_from,
+            qed_before_equilibrium,
+            qed_qmin_desired,
+            qed_equilibrium_iterations,
+            qed_ip_from,
+            sawteeth_source_after_qed,
+            sawteeth_flat_factor,
             verbose)
-        unstable = !(result.ideal_stable && result.ballooning_stable)
-        penalty = unstable ? penalty_unstable : 0.0
+        q_ok = !isfinite(q_min_required) || q_min_required <= 0.0 || (isfinite(result.q_min) && result.q_min >= q_min_required)
+        effective_ideal_stable = result.ideal_stable && q_ok
+        unstable = !(effective_ideal_stable && result.ballooning_stable)
+        penalty = q_ok ? (unstable ? penalty_unstable : 0.0) : penalty_failed
         objective = -result.beta_normal + penalty
-        status = unstable ? :unstable : :success
+        status = q_ok ? (unstable ? :unstable : :success) : :q_violation
         return (
             status=status,
             objective=objective,
-            constraints=(result.ideal_stable ? 0.0 : 1.0, result.ballooning_stable ? 0.0 : 1.0),
+            constraints=(effective_ideal_stable ? 0.0 : 1.0, result.ballooning_stable ? 0.0 : 1.0),
             beta_normal=result.beta_normal,
             unstable=unstable,
             pars=pars,
@@ -1009,7 +1059,9 @@ function _evaluate_hmode_pressure_DCON_row(
                 status=String(status),
                 objective=objective,
                 beta_normal=result.beta_normal,
-                ideal_stable=result.ideal_stable,
+                q_axis=result.q_axis,
+                q_min=result.q_min,
+                ideal_stable=effective_ideal_stable,
                 ballooning_stable=result.ballooning_stable,
                 edge=pars[:edge],
                 ped=pars[:ped],
@@ -1033,6 +1085,8 @@ function _evaluate_hmode_pressure_DCON_row(
                 status="fail",
                 objective=penalty_failed,
                 beta_normal=NaN,
+                q_axis=NaN,
+                q_min=NaN,
                 ideal_stable=false,
                 ballooning_stable=false,
                 edge=pars[:edge],
@@ -1062,6 +1116,13 @@ function optimize_Hmode_pressure_DCON(
     chease_free_boundary::Bool=false,
     dcon_cleardir::Bool=false,
     equilibrium_ip_from::Symbol=:pulse_schedule,
+    qed_before_equilibrium::Bool=false,
+    qed_qmin_desired::Float64=1.0,
+    qed_equilibrium_iterations::Int=1,
+    qed_ip_from::Union{Nothing,Symbol}=nothing,
+    sawteeth_source_after_qed::Bool=false,
+    sawteeth_flat_factor::Float64=1.0,
+    q_min_required::Float64=0.0,
     threaded::Bool=Threads.nthreads() > 1,
     distributed::Bool=false,
     distributed_workers::Vector{Int}=Distributed.workers(),
@@ -1146,6 +1207,13 @@ function optimize_Hmode_pressure_DCON(
                 chease_free_boundary,
                 dcon_cleardir,
                 equilibrium_ip_from,
+                qed_before_equilibrium,
+                qed_qmin_desired,
+                qed_equilibrium_iterations,
+                qed_ip_from,
+                sawteeth_source_after_qed,
+                sawteeth_flat_factor,
+                q_min_required,
                 verbose,
                 penalty_unstable,
                 penalty_failed)
@@ -1168,6 +1236,13 @@ function optimize_Hmode_pressure_DCON(
                     chease_free_boundary,
                     dcon_cleardir,
                     equilibrium_ip_from,
+                    qed_before_equilibrium,
+                    qed_qmin_desired,
+                    qed_equilibrium_iterations,
+                    qed_ip_from,
+                    sawteeth_source_after_qed,
+                    sawteeth_flat_factor,
+                    q_min_required,
                     verbose,
                     penalty_unstable,
                     penalty_failed)
