@@ -879,7 +879,18 @@ function evaluate_Hmode_pressure_DCON(
     end
     ActorDCON(dd_case, act_case)
 
-    beta_normal = Float64(dd_case.equilibrium.time_slice[].global_quantities.beta_normal)
+    global_quantities = dd_case.equilibrium.time_slice[].global_quantities
+    beta_normal = Float64(global_quantities.beta_normal)
+    li_3 = try
+        Float64(global_quantities.li_3)
+    catch
+        NaN
+    end
+    wmhd = try
+        Float64(global_quantities.energy_mhd)
+    catch
+        NaN
+    end
     q_profile = try
         Float64.(dd_case.equilibrium.time_slice[].profiles_1d.q)
     catch
@@ -894,6 +905,8 @@ function evaluate_Hmode_pressure_DCON(
     return (
         dd=dd_case,
         beta_normal=beta_normal,
+        li_3=li_3,
+        wmhd=wmhd,
         q_axis=q_axis,
         q_min=q_min,
         dcon=dcon,
@@ -904,7 +917,7 @@ function evaluate_Hmode_pressure_DCON(
 end
 
 function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple)
-    header = "case,status,objective,beta_normal,q_axis,q_min,ideal_stable,ballooning_stable,edge,ped,core,expin,expout,widthp,workdir,error\n"
+    header = "case,status,objective,beta_normal,li_3,wmhd,q_axis,q_min,ideal_stable,ballooning_stable,edge,ped,core,expin,expout,widthp,workdir,error\n"
     if !isfile(csv_file)
         write(csv_file, header)
     end
@@ -921,6 +934,8 @@ function _append_hmode_pressure_result(csv_file::AbstractString, row::NamedTuple
         row.status,
         row.objective,
         row.beta_normal,
+        row.li_3,
+        row.wmhd,
         row.q_axis,
         row.q_min,
         row.ideal_stable,
@@ -1052,6 +1067,8 @@ function _evaluate_hmode_pressure_DCON_row(
             objective=objective,
             constraints=(effective_ideal_stable ? 0.0 : 1.0, result.ballooning_stable ? 0.0 : 1.0),
             beta_normal=result.beta_normal,
+            li_3=result.li_3,
+            wmhd=result.wmhd,
             unstable=unstable,
             pars=pars,
             row=(
@@ -1059,6 +1076,8 @@ function _evaluate_hmode_pressure_DCON_row(
                 status=String(status),
                 objective=objective,
                 beta_normal=result.beta_normal,
+                li_3=result.li_3,
+                wmhd=result.wmhd,
                 q_axis=result.q_axis,
                 q_min=result.q_min,
                 ideal_stable=effective_ideal_stable,
@@ -1078,6 +1097,8 @@ function _evaluate_hmode_pressure_DCON_row(
             objective=penalty_failed,
             constraints=(1.0, 1.0),
             beta_normal=NaN,
+            li_3=NaN,
+            wmhd=NaN,
             unstable=true,
             pars=pars,
             row=(
@@ -1085,6 +1106,8 @@ function _evaluate_hmode_pressure_DCON_row(
                 status="fail",
                 objective=penalty_failed,
                 beta_normal=NaN,
+                li_3=NaN,
+                wmhd=NaN,
                 q_axis=NaN,
                 q_min=NaN,
                 ideal_stable=false,
