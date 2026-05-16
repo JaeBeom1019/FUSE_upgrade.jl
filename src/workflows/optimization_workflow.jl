@@ -13,9 +13,16 @@ import Serialization
         iterations::Int=N,
         continue_state::Union{Nothing,Metaheuristics.State}=missing,
         save_folder::AbstractString="optimization_runs",
-        save_dd::Bool=true)
+        save_dd::Bool=true,
+        optimization_scheduler::Symbol=:dynamic,
+        optimization_pmap_batch_size::Int=1)
 
 Multi-objective optimization of either an `actor(dd, act)` or a `workflow(ini, act)`
+
+The default `optimization_scheduler=:dynamic` keeps the generation-level genetic
+algorithm unchanged, but evaluates individuals through a one-case-at-a-time
+worker queue.  This preserves the existing CSV/HDF5 save mechanism while
+reducing worker idle time for heterogeneous FUSE runtimes.
 """
 function workflow_multiobjective_optimization(
     ini::ParametersAllInits,
