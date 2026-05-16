@@ -27,12 +27,6 @@ Base.@kwdef mutable struct FUSEparameters__ParametersStudyMultiObjectiveOptimize
     population_size::Entry{Int} = Entry{Int}("-", "Number of individuals in a generation")
     number_of_generations::Entry{Int} = Entry{Int}("-", "Number generations")
     database_policy::Switch{Symbol} = study_common_parameters(; database_policy=:single_hdf5)
-    optimization_scheduler::Switch{Symbol} =
-        Switch{Symbol}([:dynamic, :pmap_legacy], "-", "Generation evaluation scheduler. :dynamic uses a one-case-at-a-time worker queue; :pmap_legacy uses the historical pmap call."; default=:dynamic)
-    optimization_pmap_batch_size::Entry{Int} =
-        Entry{Int}("-", "Batch size used by the dynamic generation scheduler. Keep at 1 for heterogeneous FUSE case runtimes."; default=1, check=x -> @assert x > 0 "optimization_pmap_batch_size must be > 0")
-    minimum_cases_per_worker::Entry{Int} =
-        Entry{Int}("-", "If > 1, automatically increases population_size so each worker receives at least this many cases per generation. This reduces generation-tail idle time without changing CSV/HDF5 output schema."; default=1, check=x -> @assert x > 0 "minimum_cases_per_worker must be > 0")
 end
 
 mutable struct StudyMultiObjectiveOptimizer{T<:Real} <: AbstractStudy
@@ -65,29 +59,11 @@ function StudyMultiObjectiveOptimizer(
     return study
 end
 
-function _effective_ga_population_size(sty::OverrideParameters)
-    population_size = sty.population_size
-    minimum_cases_per_worker = sty.minimum_cases_per_worker
-    if minimum_cases_per_worker > 1
-        worker_count = max(length(Distributed.workers()), 1)
-        target_population_size = minimum_cases_per_worker * worker_count
-        if population_size < target_population_size
-            population_size = target_population_size
-            if isodd(population_size)
-                population_size += 1
-            end
-            @info "Increasing GA population_size for over-partitioned dynamic scheduling" requested_population_size=sty.population_size effective_population_size=population_size worker_count minimum_cases_per_worker
-        end
-    end
-    return population_size
-end
-
 function _run(study::StudyMultiObjectiveOptimizer)
     sty = study.sty
 
     @assert (sty.n_workers == 0 || sty.n_workers == length(Distributed.workers())) "The number of workers =  $(length(Distributed.workers())) isn't the number of workers you requested = $(sty.n_workers)"
-    population_size = _effective_ga_population_size(sty)
-    @assert iseven(population_size) "Population size must be even"
+    @assert iseven(sty.population_size) "Population size must be even"
 
     if sty.restart_workers_after_n_generations > 0
         # if restart_workers_after_n_generations we are going to call _run again with modified
@@ -127,7 +103,7 @@ function _run(study::StudyMultiObjectiveOptimizer)
 
     else
         optimization_parameters = Dict(
-            :N => population_size,
+            :N => sty.population_size,
             :iterations => sty.number_of_generations,
             :continue_state => study.state,
             :save_folder => sty.save_folder)
@@ -140,13 +116,8 @@ function _run(study::StudyMultiObjectiveOptimizer)
 
         study.state = workflow_multiobjective_optimization(
             study.ini, study.act, study.workflow, study.objective_functions, study.constraint_functions;
-            optimization_parameters...,
-            generation_offset=study.generation,
-            database_policy=sty.database_policy,
-            number_of_generations=sty.number_of_generations,
-            population_size=population_size,
-            optimization_scheduler=sty.optimization_scheduler,
-            optimization_pmap_batch_size=sty.optimization_pmap_batch_size)
+            optimization_parameters..., generation_offset=study.generation, sty.database_policy,
+            sty.number_of_generations, sty.population_size)
 
         save_optimization(
             joinpath(sty.save_folder, "optimization_state.bson"),

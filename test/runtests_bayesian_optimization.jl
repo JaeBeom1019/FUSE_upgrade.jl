@@ -44,19 +44,3 @@ import Random
     @test size(continued.X, 1) == 24
     @test continued.best_y <= state.best_y
 end
-
-@testset "dynamic GA generation scheduler" begin
-    items = [(1, :slow), (2, :fast), (3, :medium)]
-    out = FUSE._dynamic_generation_pmap_ordered(items; batch_size=1) do item
-        k, label = item
-        return (k, label)
-    end
-
-    @test out == items
-    @test_throws ErrorException FUSE._dynamic_generation_pmap_ordered(identity, items; batch_size=0)
-
-    sty = FUSE.study_parameters(:MultiObjectiveOptimizer)
-    @test sty.optimization_scheduler == :dynamic
-    @test sty.optimization_pmap_batch_size == 1
-    @test sty.minimum_cases_per_worker == 1
-end

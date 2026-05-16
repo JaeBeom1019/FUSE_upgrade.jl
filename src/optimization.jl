@@ -317,14 +317,6 @@ function _optimization_engine(
     return tmp
 end
 
-function _dynamic_generation_pmap_ordered(f::Function, items; batch_size::Int=1)
-    batch_size > 0 || error("optimization_pmap_batch_size must be > 0")
-    worker_pool = Distributed.CachingPool(Distributed.workers())
-    return Distributed.pmap(worker_pool, collect(items); batch_size=batch_size) do item
-        f(item)
-    end
-end
-
 """
     optimization_engine(
         ini::ParametersAllInits,
@@ -354,32 +346,11 @@ function optimization_engine(
 
     # parallel evaluation of a generation
     ProgressMeter.next!(p)
-
-    # Keep the CSV/HDF5 write path inside `_optimization_engine` untouched.  The
-    # scheduler only decides when each individual is handed to an available worker.
-    worker_kw = Dict{Symbol,Any}(kw)
-    optimization_scheduler = get(worker_kw, :optimization_scheduler, :dynamic)
-    optimization_pmap_batch_size = get(worker_kw, :optimization_pmap_batch_size, 1)
-    delete!(worker_kw, :optimization_scheduler)
-    delete!(worker_kw, :optimization_pmap_batch_size)
-
-    generation = p.counter + generation_offset
-    tasks = [(k, X[k, :]) for k in axes(X, 1)]
-    tmp = if optimization_scheduler == :dynamic
-        _dynamic_generation_pmap_ordered(tasks; batch_size=optimization_pmap_batch_size) do item
-            k, x = item
-            _optimization_engine(ini, act, actor_or_workflow, x, objective_functions, constraint_functions, save_folder, generation, save_dd; case_index=k, worker_kw...)
-        end
-    elseif optimization_scheduler == :pmap_legacy
-        Distributed.pmap(
-            (k,x) -> _optimization_engine(ini, act, actor_or_workflow, x, objective_functions, constraint_functions, save_folder, generation, save_dd; case_index=k, worker_kw...),
-            1:size(X, 1),
-            [X[k, :] for k in axes(X, 1)]
-        )
-    else
-        error("optimization_scheduler must be `:dynamic` or `:pmap_legacy`")
-    end
-
+    tmp = Distributed.pmap(
+        (k,x) -> _optimization_engine(ini, act, actor_or_workflow, x, objective_functions, constraint_functions, save_folder, p.counter + generation_offset, save_dd; case_index=k, kw...),
+        1:size(X,1),
+        [X[k, :] for k in 1:size(X)[1]]
+    )
     F = zeros(size(X)[1], length(tmp[1][1]))
     G = zeros(size(X)[1], max(length(tmp[1][2]), 1))
     H = zeros(size(X)[1], max(length(tmp[1][3]), 1))
